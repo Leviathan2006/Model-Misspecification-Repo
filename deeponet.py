@@ -13,6 +13,7 @@ cheaper than differentiating u per sample.
 """
 import torch
 import torch.nn as nn
+from torch.func import jvp
 
 
 class MLP(nn.Module):
@@ -52,25 +53,20 @@ class DeepONet(nn.Module):
 
 
 def trunk_derivatives(trunk, y, order=2):
-    """Return the trunk basis and its y-derivatives at query points y.
+    """Return the trunk basis and its y-derivatives at query points y (1D input).
 
-    y: (Q, d) leaf tensor with requires_grad=True.
-    Returns t (Q,p) and, for d==1, first/second derivatives (Q,p) up to `order`.
-    Uses batched autograd so all p basis functions are differentiated in one call.
+    Uses FORWARD-mode autodiff (jvp): since the trunk input is one-dimensional, a
+    single jvp yields the derivative of all p basis functions at once -- O(1)
+    passes instead of O(p). Nested jvp gives the second derivative. The outputs
+    stay connected to the trunk parameters, so loss.backward() trains normally.
+
+    Returns t (Q,p) and, up to `order`, first/second derivatives (Q,p).
     """
-    t = trunk(y)                                           # (Q, p)
-    Q, p = t.shape
-    eye = torch.eye(p, device=y.device)[:, None, :].expand(p, Q, p)
-
-    def dydx(f):
-        g = torch.autograd.grad(f, y, grad_outputs=eye, is_grads_batched=True,
-                                create_graph=True, retain_graph=True)[0]
-        return g.squeeze(-1).transpose(0, 1).contiguous()  # (Q, p)
-
-    t_y = dydx(t)
+    ones = torch.ones_like(y)
     if order == 1:
+        t, t_y = jvp(trunk, (y,), (ones,))
         return t, t_y
-    t_yy = dydx(t_y)
+    (t, t_y), (_, t_yy) = jvp(lambda z: jvp(trunk, (z,), (ones,)), (y,), (ones,))
     return t, t_y, t_yy
 
 

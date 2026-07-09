@@ -75,7 +75,7 @@ def build_data(cfg, device, seed=0):
     return {
         "vs_tr": T((vs_tr - mu) / sd), "vs_te": T((vs_te - mu) / sd),
         "uo_tr": T(uo_tr), "vc_tr": T(vc_tr), "ut_te": T(ut_te),
-        "y_coll": T(x_c[:, None], grad=True),
+        "y_coll": T(x_c[:, None]),   # jvp supplies tangents; no leaf-grad needed
         "x_s": T(x_s[:, None]), "x_o": T(x_o[:, None]),
         "x_t": T(x_t[:, None]), "x_bc": T(x_bc[:, None]),
     }
