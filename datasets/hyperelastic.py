@@ -28,8 +28,9 @@ import argparse
 import os
 
 import numpy as np
-from scipy.sparse import coo_matrix
-from scipy.sparse.linalg import spsolve
+
+# scipy is imported lazily inside the solver so the repo runs on the bundled
+# datasets without scipy installed (it is only needed to *generate* this data).
 
 E, NU = 1.0e6, 0.3
 MU = E / (2.0 * (1.0 + NU))
@@ -81,6 +82,7 @@ def _det_inv_2x2(A):
 
 def _element_terms(coords, elems, u):
     """Assemble global internal force and tangent for displacement u (ndof,)."""
+    from scipy.sparse import coo_matrix
     ne = elems.shape[0]
     N, dNdxi = _shape()
     Xe = coords[elems]                                     # (ne,4,2)
@@ -150,6 +152,7 @@ def _body_force(coords, elems):
 
 def solve_beam(eps, nx=100, ny=20, n_steps=10, newton_tol=1e-8, max_newton=25):
     """Solve one beam at compression eps. Returns u field (ny+1, nx+1, 2)."""
+    from scipy.sparse.linalg import spsolve
     coords, elems, nid = _mesh(nx, ny)
     ndof = coords.shape[0] * 2
     Fext = _body_force(coords, elems)
