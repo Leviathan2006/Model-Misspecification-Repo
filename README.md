@@ -70,6 +70,24 @@ python run_fno.py --problem hyperelastic
 use and reuse afterwards. Reduce `--n_train`/grid sizes on the dataset scripts for
 quick local checks.
 
+## Results (vanilla FNO, Tesla T4, bundled `--quick`-sized data, 500 epochs)
+
+| problem | test rel. L2 | status |
+|---|---|---|
+| `diffusion_reaction` | 4.7e-3 | good |
+| `burgers` | 1.5e-3 | good |
+| `cavity_flow` | 7.4e-3 | good (only 20 train samples) |
+| `hyperelastic` | 8.4e-1 | **broken — see note** |
+
+**Hyperelastic is not learnable as currently generated.** A 10:1 slender beam
+compressed up to ε≈0.19 is far past its buckling load (critical strain ~0.2%), and
+the current FEM (no line search; `detF` is clipped rather than rejecting inverted
+elements) produces nonphysical post-buckling displacements — `|u|≈30` on a domain
+of size 1×0.1, with sign-flipping `u_y`. The ε→u map is then effectively chaotic
+and cannot be fit. Fix planned: robust Newton (line search + inverted-element
+step-cutting + more continuation steps), or a milder ε range. The other three
+problems are solid.
+
 ## Validation status
 
 All solvers were smoke-tested at coarse resolution:
