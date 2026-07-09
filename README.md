@@ -148,6 +148,27 @@ solution is the **prior** `G_θ(v)`; the literal `G_θ+G_ψ` sum from the paper'
 Eq. (c) is dimensionally inconsistent for the FNO and is reported only as a
 diagnostic. Physics-informed training needs ~1e4–1e5 epochs to converge.
 
+## Our methods (trustworthy extensions)
+
+The paper's correction is a single deterministic model with no uncertainty. Two
+extensions in the "trustworthy operator learning" direction, both on the
+PI-DeepONet backbone and both logging to a file under `results/`:
+
+- **Deep-ensemble correction** (`method_ensemble.py`): K corrected models from
+  different inits; the ensemble mean improves the point estimate and the ensemble
+  std is a calibrated epistemic-uncertainty map (we report corr(std, |error|)).
+  -> `results/method_ensemble.txt`
+- **Heteroscedastic correction under noisy observations**
+  (`method_heteroscedastic.py`): a variance head + Gaussian-NLL data term gives
+  robustness to observation noise and a calibrated aleatoric-uncertainty map,
+  compared head-to-head with the deterministic correction on the same noisy data.
+  -> `results/method_heteroscedastic.txt`
+
+```bash
+python method_ensemble.py --n_ensemble 5 --epochs 100000
+python method_heteroscedastic.py --noise 0.15 --epochs 100000
+```
+
 ## Data
 
 `data/` ships small (`--quick`-sized) `.npz` datasets for all four problems so
