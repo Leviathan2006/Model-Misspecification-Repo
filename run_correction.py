@@ -81,6 +81,14 @@ def build_data(cfg, device, seed=0):
     }
 
 
+def _hard_bc(x):
+    """Boundary factor g(x)=1-x^2 and its derivatives, so u=g*f obeys u(+-1)=0
+    exactly. Returns g, g' as (1,N) rows; g'' is the constant -2."""
+    g = (1.0 - x ** 2).T
+    gx = (-2.0 * x).T
+    return g, gx, -2.0
+
+
 def train_mode(mode, d, cfg, device, seed=0):
     torch.manual_seed(seed)
     prior = DeepONet(cfg["n_sensors"], 1, cfg["p"], cfg["width"], cfg["depth"]).to(device)
@@ -92,27 +100,34 @@ def train_mode(mode, d, cfg, device, seed=0):
     opt = torch.optim.Adam(params, lr=cfg["lr"])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg["epochs"])
 
+    gc, gcx, gcxx = _hard_bc(d["y_coll"])          # collocation boundary factor
+    go, _, _ = _hard_bc(d["x_o"])                  # observation points
+    gs, _, _ = _hard_bc(d["x_s"])                  # sensor points
+
+    def prior_solution(bp, y, g):
+        return g * (bp @ prior.trunk_out(y).T + prior.bias)
+
     for epoch in range(cfg["epochs"]):
         opt.zero_grad(set_to_none=True)
-        t, _, t_xx = trunk_derivatives(prior.trunk, d["y_coll"], order=2)   # (Q,p)
-        bp = prior.branch_out(d["vs_tr"])                                   # (M,p)
-        u_coll = bp @ t.T + prior.bias                                      # (M,Q)
-        u_xx = bp @ t_xx.T
-        u_obs = bp @ prior.trunk_out(d["x_o"]).T + prior.bias
-        u_bc = bp @ prior.trunk_out(d["x_bc"]).T + prior.bias
+        t, t_x, t_xx = trunk_derivatives(prior.trunk, d["y_coll"], order=2)  # (Q,p)
+        bp = prior.branch_out(d["vs_tr"])                                    # (M,p)
+        f = bp @ t.T + prior.bias
+        f_x, f_xx = bp @ t_x.T, bp @ t_xx.T
+        u_coll = gc * f                                                      # hard BC
+        u_xx = gcxx * f + 2.0 * gcx * f_x + gc * f_xx                        # product rule
+        u_obs = prior_solution(bp, d["x_o"], go)
 
         if mode == "known":
             res = dr.D * u_xx - 0.5 * torch.exp(-u_coll) * u_coll - d["vc_tr"]
         elif mode == "misspecified":
             res = dr.D * u_xx - K_R_CONST - d["vc_tr"]
         else:  # corrected
-            u_sens = bp @ prior.trunk_out(d["x_s"]).T + prior.bias          # (M, n_sensors)
+            u_sens = prior_solution(bp, d["x_s"], gs)                        # (M, n_sensors)
             cin = torch.cat([d["vs_tr"], u_sens.detach()], dim=1)
             c_coll = corr.branch_out(cin) @ corr.trunk_out(d["y_coll"]).T + corr.bias
             res = dr.D * u_xx - K_R_CONST + c_coll - d["vc_tr"]
 
-        loss = (res ** 2).mean() + LAMBDA_D * ((u_obs - d["uo_tr"]) ** 2).mean() \
-            + LAMBDA_BC * (u_bc ** 2).mean()
+        loss = (res ** 2).mean() + LAMBDA_D * ((u_obs - d["uo_tr"]) ** 2).mean()
         loss.backward(inputs=params)
         opt.step()
         sched.step()
@@ -123,11 +138,12 @@ def train_mode(mode, d, cfg, device, seed=0):
     corr.eval()
     with torch.no_grad():
         bp = prior.branch_out(d["vs_te"])
-        u_pred = bp @ prior.trunk_out(d["x_t"]).T + prior.bias
+        gt, _, _ = _hard_bc(d["x_t"])
+        u_pred = gt * (bp @ prior.trunk_out(d["x_t"]).T + prior.bias)
         err_prior = rel_l2(u_pred, d["ut_te"])
         err_full = err_prior
         if mode == "corrected":
-            u_sens = bp @ prior.trunk_out(d["x_s"]).T + prior.bias
+            u_sens = prior_solution(bp, d["x_s"], gs)
             cin = torch.cat([d["vs_te"], u_sens], dim=1)
             c_pred = corr.branch_out(cin) @ corr.trunk_out(d["x_t"]).T + corr.bias
             err_full = rel_l2(u_pred + c_pred, d["ut_te"])
