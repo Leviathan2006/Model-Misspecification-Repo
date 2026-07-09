@@ -144,17 +144,24 @@ def _apply_boundaries(f, rho, u_lid, U0):
     return f
 
 
-def generate(n_samples, N=101, seed=0, max_iter=60000, tol=1e-6):
-    """Return (x, y, Re, u) with u of shape (n_samples, N, N, 2)."""
+def generate(n_samples, N=101, seed=0, max_iter=60000, tol=1e-6, chunk=100):
+    """Return (x, y, Re, u) with u of shape (n_samples, N, N, 2).
+
+    Samples are solved in chunks so the vectorised LBM state stays within memory
+    (a full 1000-sample batch at 101x101 would need many GB)."""
     rng = np.random.default_rng(seed)
     Re = rng.uniform(100.0, 200.0, size=n_samples)
-    u = solve_cavity(Re, N=N, max_iter=max_iter, tol=tol)
+    parts = []
+    for i in range(0, n_samples, chunk):
+        parts.append(solve_cavity(Re[i:i + chunk], N=N,
+                                  max_iter=max_iter, tol=tol))
+    u = np.concatenate(parts, axis=0)
     grid = np.linspace(0.0, 1.0, N)
     return grid, grid, Re, u
 
 
 def get_dataset(data_dir="data", n_train=1000, n_test=100, N=101, seed=0,
-                max_iter=60000, tol=1e-6):
+                max_iter=60000, tol=1e-6, chunk=100):
     """Load cached data or generate + cache it.
     Returns (coords, Re_train, u_train, Re_test, u_test)."""
     path = os.path.join(data_dir, "cavity_flow.npz")
@@ -162,8 +169,8 @@ def get_dataset(data_dir="data", n_train=1000, n_test=100, N=101, seed=0,
         d = np.load(path)
         return ((d["x"], d["y"]), d["Re_train"], d["u_train"],
                 d["Re_test"], d["u_test"])
-    x, y, Re_tr, u_tr = generate(n_train, N, seed, max_iter, tol)
-    _, _, Re_te, u_te = generate(n_test, N, seed + 1, max_iter, tol)
+    x, y, Re_tr, u_tr = generate(n_train, N, seed, max_iter, tol, chunk)
+    _, _, Re_te, u_te = generate(n_test, N, seed + 1, max_iter, tol, chunk)
     os.makedirs(data_dir, exist_ok=True)
     np.savez(path, x=x, y=y, Re_train=Re_tr, u_train=u_tr,
              Re_test=Re_te, u_test=u_te)

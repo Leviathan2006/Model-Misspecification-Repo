@@ -105,37 +105,29 @@ def evaluate(model, inp, Y, device, bs=50):
     return tot / len(inp)
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--problem", choices=list(PREP), default="diffusion_reaction")
-    p.add_argument("--epochs", type=int, default=300)
-    p.add_argument("--batch", type=int, default=20)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--data_dir", type=str, default="data")
-    p.add_argument("--seed", type=int, default=0)
-    a = p.parse_args()
-
-    torch.manual_seed(a.seed)
-    np.random.seed(a.seed)
+def train(problem, epochs=300, batch=20, lr=1e-3, data_dir="data", seed=0):
+    """Train + evaluate the FNO on one problem. Returns test relative L2."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    inp_tr, Ytr, inp_te, Yte, model = PREP[a.problem](a.data_dir)
+    inp_tr, Ytr, inp_te, Yte, model = PREP[problem](data_dir)
     inp_tr = torch.tensor(np.ascontiguousarray(inp_tr), dtype=torch.float32)
     Ytr = torch.tensor(np.ascontiguousarray(Ytr), dtype=torch.float32)
     inp_te = torch.tensor(np.ascontiguousarray(inp_te), dtype=torch.float32)
     Yte = torch.tensor(np.ascontiguousarray(Yte), dtype=torch.float32)
 
     model = model.to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=a.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs)
-    loader = DataLoader(TensorDataset(inp_tr, Ytr), batch_size=a.batch,
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    loader = DataLoader(TensorDataset(inp_tr, Ytr), batch_size=batch,
                         shuffle=True)
 
     n_params = sum(q.numel() for q in model.parameters())
-    print(f"[{a.problem}] device={device}  params={n_params:,}  "
+    print(f"[{problem}] device={device}  params={n_params:,}  "
           f"train={len(Ytr)}  test={len(Yte)}  in={tuple(inp_tr.shape[1:])}")
 
-    for epoch in range(a.epochs):
+    for epoch in range(epochs):
         model.train()
         tot = 0.0
         for xb, yb in loader:
@@ -146,7 +138,7 @@ def main():
             opt.step()
             tot += loss.item() * len(yb)
         sched.step()
-        if (epoch + 1) % max(1, a.epochs // 10) == 0 or epoch == 0:
+        if (epoch + 1) % max(1, epochs // 10) == 0 or epoch == 0:
             model.eval()
             te = evaluate(model, inp_te, Yte, device)
             print(f"  epoch {epoch+1:4d}  train relL2 {tot/len(Ytr):.4e}  "
@@ -154,11 +146,23 @@ def main():
 
     model.eval()
     test_err = evaluate(model, inp_te, Yte, device)
-    print(f"[{a.problem}] FINAL test relative L2 = {test_err:.4e}")
+    print(f"[{problem}] FINAL test relative L2 = {test_err:.4e}")
     os.makedirs("results", exist_ok=True)
     with open("results/summary.txt", "a") as f:
-        f.write(f"{a.problem}\tepochs={a.epochs}\ttest_relL2={test_err:.6e}\n")
+        f.write(f"{problem}\tepochs={epochs}\ttest_relL2={test_err:.6e}\n")
     return test_err
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--problem", choices=list(PREP), default="diffusion_reaction")
+    p.add_argument("--epochs", type=int, default=300)
+    p.add_argument("--batch", type=int, default=20)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--data_dir", type=str, default="data")
+    p.add_argument("--seed", type=int, default=0)
+    a = p.parse_args()
+    train(a.problem, a.epochs, a.batch, a.lr, a.data_dir, a.seed)
 
 
 if __name__ == "__main__":
