@@ -1,0 +1,112 @@
+# FNO baselines on the "model misspecification" operator-learning suite
+
+Faithful reproduction of the **problem suite** from
+
+> L. Ma, N. Boullé, Y.-S. Yang, H. Wu, L. Guo,
+> *Physics-guided correction for operator learning under model misspecification*,
+> [arXiv:2606.03469](https://arxiv.org/abs/2606.03469) (2026),
+
+with a **vanilla, data-driven Fourier Neural Operator (FNO)** as the learner
+instead of the paper's physics-informed DeepONet. The paper notes its correction
+framework is architecture-independent ("any neural operator"); this repo builds
+the FNO baseline side of that claim on all four benchmarks.
+
+## Read this first — what is and isn't reproduced
+
+The paper's *method* is a physics-informed DeepONet that corrects a **misspecified
+governing equation** (e.g. treating a shear-thinning fluid as Newtonian). That
+notion of misspecification lives entirely in the **physics loss**. A vanilla FNO
+is **data-driven** — it never sees a governing equation, so "misspecification"
+does not apply to it. What this repo reproduces faithfully is:
+
+1. the **data generation** for each benchmark, from the paper's **true** models
+   and exact constants, and
+2. **FNO baselines** that learn each true solution operator from data — the
+   data-driven reference any physics-guided method is ultimately compared to.
+
+The four learned operators (as defined in the paper):
+
+| problem | operator | dim | solver used to make the data |
+|---|---|---|---|
+| `diffusion_reaction` | `v(x) → u(x)` | 1D | method of manufactured solutions (no solver) |
+| `burgers` | `u₀(x) → u(x,t)` | 2D | Fourier pseudo-spectral + forward Euler |
+| `cavity_flow` | `Re → (u_x,u_y)(x,y)` | 2D | D2Q9 Lattice-Boltzmann, power-law rheology |
+| `hyperelastic` | `ε → (u_x,u_y)(x,y)` | 2D | Q1 neo-Hookean FEM, Newton + load continuation |
+
+## Layout
+
+```
+datasets/
+  diffusion_reaction.py   v → u,  D=0.1, k_r=0.5 e^{-u}, manufactured solutions
+  burgers.py              u₀ → u(x,t),  ν=0.01, GRF ICs, pseudo-spectral solver
+  cavity_flow.py          Re → velocity,  power-law n=1.5, Re∈[100,200], LBM
+  hyperelastic.py         ε → displacement,  neo-Hookean beam, ε∈[0,0.2], FEM
+fno.py                    vanilla FNO1d and FNO2d
+run_fno.py                trains/evaluates the FNO on a chosen problem
+```
+
+Every dataset script is self-contained (only `numpy`, plus `scipy.sparse` for the
+FEM) and vectorised over the sample axis, so it clones and runs on Kaggle CPU/GPU.
+
+## Quickstart
+
+```bash
+pip install -r requirements.txt
+
+# generate data (paper sizes; the 2D solvers are the slow ones — run on Kaggle)
+python datasets/diffusion_reaction.py
+python datasets/burgers.py
+python datasets/cavity_flow.py
+python datasets/hyperelastic.py
+
+# train + evaluate the FNO
+python run_fno.py --problem diffusion_reaction
+python run_fno.py --problem burgers
+python run_fno.py --problem cavity_flow
+python run_fno.py --problem hyperelastic
+```
+
+`get_dataset(...)` caches to `data/*.npz`, so `run_fno.py` will generate on first
+use and reuse afterwards. Reduce `--n_train`/grid sizes on the dataset scripts for
+quick local checks.
+
+## Validation status
+
+All solvers were smoke-tested at coarse resolution:
+
+- **diffusion-reaction** — Dirichlet BCs `u(±1)=0` satisfied exactly (the
+  prefactor `(x²−1)/10` enforces them); no NaNs.
+- **burgers** — viscous energy decays; fields bounded; no NaNs. Note the GRF
+  `𝒩(0, 25²(−Δ+5²I)⁻⁴)` is smooth and small-amplitude by construction; the FNO
+  target is scale-free (relative L2) so this is immaterial to the benchmark.
+- **cavity_flow** — top-row velocity correlates 1.00 with the prescribed lid
+  profile, speeds ≈ lid speed, no NaNs.
+- **hyperelastic** — left edge clamped (`u=0`), right edge reaches `u_x=−ε`
+  exactly, Newton converges, no NaNs.
+
+The **full-resolution runs and FNO training are intended for Kaggle GPUs** and
+were not run here.
+
+## Caveats (documented, not hidden)
+
+- **Cavity non-dimensionalisation.** The paper does not print the exact constant
+  linking `Re` to the power-law consistency in its Lattice-Boltzmann setup. We use
+  `ν₀ = U₀(N−1)/Re` with a small lattice lid speed `U₀`; the qualitative physics
+  and the operator `Re → u` are faithful, but the absolute Reynolds constant may
+  differ by an O(1) factor. See the docstring in `datasets/cavity_flow.py`.
+- **DeepONet-specific pieces are omitted on purpose.** Physics residual losses,
+  collocation points, and the misspecified operators are part of the paper's
+  method, not its data — they are not needed for a data-driven FNO.
+
+## Paper reference numbers (DeepONet, for context — not FNO)
+
+Corrected relative errors reported by the paper: diffusion-reaction ≈1.85×10⁻³,
+Burgers (case B) ≈1.01%, cavity `u_x` ≈0.82%, hyperelastic `u_x` ≈3.75×10⁻³.
+These are the *physics-guided-corrected DeepONet* numbers; the FNO baselines here
+are a separate, data-driven measurement.
+
+## Roadmap
+
+- [ ] fill in FNO baseline numbers from a full Kaggle run
+- [ ] add the physics-guided **correction** experiment (the paper's actual method)
+      on an FNO backbone, incl. a diffusion-based probabilistic corrector variant
