@@ -105,8 +105,41 @@ Burgers (case B) ≈1.01%, cavity `u_x` ≈0.82%, hyperelastic `u_x` ≈3.75×10
 These are the *physics-guided-corrected DeepONet* numbers; the FNO baselines here
 are a separate, data-driven measurement.
 
+## Physics-guided correction (the paper's actual method) — `physics_correction.py`
+
+`physics_correction.py` implements the paper's method on an **FNO backbone** for
+the diffusion-reaction benchmark (a physics-informed FNO / PINO-style residual):
+
+- **prior** `G_θ : v → u_prior`, **correction** `G_ψ : [v, u_prior] → c`
+- `L_data = ‖G_θ(v)(obs) − u(obs)‖²`  (sparse observations)
+- `L_physics = ‖N₀[G_θ(v)] + G_ψ(·) − v‖²`  (collocation; correction in **forcing space**)
+- misspecified `N₀ = D u_xx − k_r` (constant) vs true `D u_xx − 0.5 e^{−u} u`
+
+Run the three-way comparison that reproduces the paper's headline story:
+
+```bash
+python physics_correction.py --mode all --epochs 100000
+```
+
+- `known` (true physics) ≈ reference floor
+- `misspecified` (wrong `N₀`, no correction) → error blows up
+- `corrected` (prior + forcing-space correction) → recovered
+
+**Readout note.** `G_ψ` is trained in forcing/residual space, so the recovered
+solution is the **prior** `G_θ(v)`; the literal `G_θ+G_ψ` sum from the paper's
+Eq. (c) is dimensionally inconsistent for the FNO and is reported only as a
+diagnostic. Physics-informed training needs ~1e4–1e5 epochs to converge.
+
+## Data
+
+`data/` ships small (`--quick`-sized) `.npz` datasets for all four problems so
+the repo runs immediately on clone. Regenerate at paper sizes with the dataset
+scripts or `kaggle_run.py` (delete the cached `.npz` first).
+
 ## Roadmap
 
 - [ ] fill in FNO baseline numbers from a full Kaggle run
-- [ ] add the physics-guided **correction** experiment (the paper's actual method)
-      on an FNO backbone, incl. a diffusion-based probabilistic corrector variant
+- [ ] extend `physics_correction.py` to Burgers (clean residual) and, later, the
+      cavity/hyperelastic PDE-system residuals
+- [ ] diffusion-based **probabilistic** corrector variant (uncertainty on the
+      model discrepancy) — the Boullé cold-email hook
