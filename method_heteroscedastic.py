@@ -1,18 +1,21 @@
-"""Our method 2: Heteroscedastic physics-guided correction under noisy observations.
+"""Our method 2: Heteroscedastic physics-guided correction under STRUCTURED noise.
 
-The paper's correction is deterministic and its data term is a plain least-squares
-fit -- it implicitly assumes clean observations. Real misspecified settings have
-NOISY, sparse data. We give the prior a variance head s(x) and replace the data
-term with a Gaussian negative log-likelihood
+The paper's correction is deterministic with a plain least-squares data term -- it
+implicitly trusts every observation equally. Real misspecified settings have
+noisy, sparse data whose reliability varies across the domain. We give the prior a
+variance head s(x) and use a Gaussian negative log-likelihood data term
 
-    L_data = mean[ 0.5 e^{-s} (u_pred - u_obs)^2 + 0.5 s ]        (at obs points)
+    L_data = mean[ 0.5 e^{-s(x)} (u_pred - u_obs)^2 + 0.5 s(x) ]     (at obs points)
 
-so the model (a) down-weights noisy observations instead of overfitting them, and
-(b) outputs a calibrated per-point aleatoric-uncertainty map exp(s/2).
+so the model learns *which observations to trust* and outputs a calibrated
+aleatoric-uncertainty map exp(s/2).
 
-We train, on the SAME noisy data, both the deterministic correction (MSE data
-term) and our heteroscedastic one, and report their clean-solution error plus the
-calibration of the heteroscedastic uncertainty.
+To test this properly we inject SPATIALLY-VARYING observation noise: the std ramps
+across the domain (nearly clean near x=-1, noisy near x=+1). We then check two
+things against the deterministic correction trained on the same noisy data:
+  1. robustness -- clean-solution relative L2, and
+  2. calibration -- does the predicted std recover the true spatial noise map?
+     (correlation between the learned std at obs points and the true noise std).
 
 Results are written to results/method_heteroscedastic.txt.
 """
@@ -31,8 +34,8 @@ from run_correction import (FULL, K_R_CONST, LAMBDA_D, QUICK, _hard_bc,
 
 
 def fit(d, cfg, device, noisy_obs, hetero, seed=0):
-    """Train a corrected model on noisy_obs. Returns (u_pred, std_pred).
-    std_pred is the aleatoric std map if hetero else None."""
+    """Train a corrected model on noisy_obs. Returns (u_pred_test, std_at_obs).
+    std_at_obs is (M, N_u) predicted aleatoric std if hetero else None."""
     torch.manual_seed(seed)
     prior = DeepONet(cfg["n_sensors"], 1, cfg["p"], cfg["width"], cfg["depth"]).to(device)
     corr = DeepONet(2 * cfg["n_sensors"], 1, cfg["p"], cfg["width"], cfg["depth"]).to(device)
@@ -74,11 +77,11 @@ def fit(d, cfg, device, noisy_obs, hetero, seed=0):
         bp = prior.branch_out(d["vs_te"])
         gt, _, _ = _hard_bc(d["x_t"])
         u_pred = gt * (bp @ prior.trunk_out(d["x_t"]).T + prior.bias)
-        std_pred = None
-        if hetero:
-            s_te = unc.branch_out(d["vs_te"]) @ unc.trunk_out(d["x_t"]).T + unc.bias
-            std_pred = torch.exp(0.5 * s_te)
-    return u_pred, std_pred
+        std_obs = None
+        if hetero:                                 # obs belong to the train samples
+            s_obs = unc.branch_out(d["vs_tr"]) @ unc.trunk_out(d["x_o"]).T + unc.bias
+            std_obs = torch.exp(0.5 * s_obs)
+    return u_pred, std_obs
 
 
 def pearson(a, b):
@@ -88,8 +91,8 @@ def pearson(a, b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--noise", type=float, default=0.15,
-                    help="obs noise std as a fraction of the observation std")
+    ap.add_argument("--noise", type=float, default=0.3,
+                    help="peak obs-noise std as a fraction of the observation std")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--quick", action="store_true")
     a = ap.parse_args()
@@ -102,35 +105,43 @@ def main():
 
     d = build_data(cfg, device)
     u_true = d["ut_te"]
+
+    # STRUCTURED noise: std ramps from ~0.1x (near x=-1) to 1.0x (near x=+1)
     torch.manual_seed(0)
-    sigma = a.noise * d["uo_tr"].std()
-    noisy_obs = d["uo_tr"] + sigma * torch.randn_like(d["uo_tr"])
+    xo = d["x_o"].squeeze(-1)                              # (N_u,) in [-1,1]
+    ramp = 0.1 + 0.9 * (xo + 1.0) / 2.0
+    sigma_o = a.noise * d["uo_tr"].std() * ramp           # (N_u,) per-location std
+    noisy_obs = d["uo_tr"] + sigma_o[None, :] * torch.randn_like(d["uo_tr"])
 
     t0 = time.time()
     u_det, _ = fit(d, cfg, device, noisy_obs, hetero=False)
-    u_het, std = fit(d, cfg, device, noisy_obs, hetero=True)
+    u_het, std_obs = fit(d, cfg, device, noisy_obs, hetero=True)
     err_det = rel_l2(u_det, u_true)
     err_het = rel_l2(u_het, u_true)
-    calib = pearson(std.flatten(), (u_het - u_true).abs().flatten())
+    # calibration: does the learned std recover the true spatial noise map?
+    pred_std_map = std_obs.mean(0)                        # (N_u,) avg over samples
+    calib_noise = pearson(pred_std_map, sigma_o)
     dt = time.time() - t0
 
     os.makedirs("results", exist_ok=True)
     path = "results/method_heteroscedastic.txt"
     with open(path, "w") as fo:
-        fo.write("Method 2 -- Heteroscedastic Correction under Noisy Observations "
+        fo.write("Method 2 -- Heteroscedastic Correction under STRUCTURED Noise "
                  "(diffusion-reaction)\n")
         fo.write(datetime.datetime.now().isoformat(timespec="seconds") + "\n")
-        fo.write(f"device={device}  epochs={cfg['epochs']}  noise={a.noise} "
-                 f"(sigma={float(sigma):.4e})  M={cfg['M_train']}  "
-                 f"sensors={cfg['n_sensors']}\n\n")
+        fo.write(f"device={device}  epochs={cfg['epochs']}  peak_noise={a.noise}  "
+                 f"M={cfg['M_train']}  sensors={cfg['n_sensors']}\n")
+        fo.write("noise std ramps ~0.1x -> 1.0x across x in [-1,1] "
+                 f"(true sigma range {float(sigma_o.min()):.4e}..{float(sigma_o.max()):.4e})\n\n")
         fo.write(f"deterministic correction (MSE) relL2 : {err_det:.4e}\n")
         fo.write(f"heteroscedastic correction    relL2 : {err_het:.4e}    "
-                 "(lower = more robust to noise)\n")
-        fo.write(f"mean predicted aleatoric std        : {std.mean().item():.4e}\n")
-        fo.write(f"calibration corr(std,|err|)         : {calib:.3f}    "
-                 "(>0 means uncertainty tracks error)\n")
+                 "(lower = more robust)\n")
+        fo.write(f"mean predicted aleatoric std        : {pred_std_map.mean().item():.4e}\n")
+        fo.write(f"CALIBRATION corr(pred std, true noise map): {calib_noise:.3f}    "
+                 "(->1 means it recovered where the noise is)\n")
         fo.write(f"wall time                           : {dt:.0f}s\n")
-    print(f"\nwrote {path}  | det {err_det:.4e}  hetero {err_het:.4e}  calib {calib:.3f}")
+    print(f"\nwrote {path}  | det {err_det:.4e}  hetero {err_het:.4e}  "
+          f"noise-map calib {calib_noise:.3f}")
 
 
 if __name__ == "__main__":
