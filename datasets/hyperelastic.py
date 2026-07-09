@@ -150,8 +150,27 @@ def _body_force(coords, elems):
     return Fext
 
 
-def solve_beam(eps, nx=100, ny=20, n_steps=10, newton_tol=1e-8, max_newton=25):
-    """Solve one beam at compression eps. Returns u field (ny+1, nx+1, 2)."""
+def _min_detF(coords, elems, u):
+    """Minimum deformation-gradient determinant over all Gauss points (<=0 means
+    an element has inverted)."""
+    _, dNdxi = _shape()
+    Xe, ue = coords[elems], u.reshape(-1, 2)[elems]
+    Jref = np.einsum("eai,gaJ->egiJ", Xe, dNdxi)
+    _, invJ = _det_inv_2x2(Jref)
+    gradN = np.einsum("gaK,egKJ->egaJ", dNdxi, invJ)
+    F = np.eye(2)[None, None] + np.einsum("eai,egaJ->egiJ", ue, gradN)
+    detF, _ = _det_inv_2x2(F)
+    return detF.min()
+
+
+def solve_beam(eps, nx=100, ny=20, n_steps=25, newton_tol=1e-8, max_newton=40):
+    """Solve one beam at compression eps. Returns u field (ny+1, nx+1, 2).
+
+    Robust against post-buckling element inversion: load continuation over
+    n_steps, and a backtracking line search that shrinks each Newton update
+    until no element is inverted (det F > 0 everywhere). This keeps the solution
+    on the physical branch instead of blowing up to nonphysical displacements.
+    """
     from scipy.sparse.linalg import spsolve
     coords, elems, nid = _mesh(nx, ny)
     ndof = coords.shape[0] * 2
@@ -161,6 +180,7 @@ def solve_beam(eps, nx=100, ny=20, n_steps=10, newton_tol=1e-8, max_newton=25):
     right = nid[:, -1].ravel()
     fixed = np.concatenate([2 * left, 2 * left + 1, 2 * right, 2 * right + 1])
     free = np.setdiff1d(np.arange(ndof), fixed)
+    scale = 1.0 + np.linalg.norm(Fext[free])
 
     u = np.zeros(ndof)
     for step in range(1, n_steps + 1):
@@ -169,13 +189,18 @@ def solve_beam(eps, nx=100, ny=20, n_steps=10, newton_tol=1e-8, max_newton=25):
         u[2 * right + 1] = 0.0
         for _ in range(max_newton):
             Fint, K = _element_terms(coords, elems, u)
-            R = Fint - Fext
-            Rf = R[free]
-            if np.linalg.norm(Rf) < newton_tol * (1 + np.linalg.norm(Fext[free])):
+            Rf = (Fint - Fext)[free]
+            if np.linalg.norm(Rf) < newton_tol * scale:
                 break
-            Kff = K[free][:, free]
-            du = spsolve(Kff.tocsc(), -Rf)
-            u[free] += du
+            du = spsolve(K[free][:, free].tocsc(), -Rf)
+            alpha = 1.0                                    # backtracking line search
+            for _ in range(30):
+                u_try = u.copy()
+                u_try[free] += alpha * du
+                if _min_detF(coords, elems, u_try) > 1e-6:
+                    break
+                alpha *= 0.5
+            u[free] += alpha * du
     return u.reshape(-1, 2)[nid]                           # (ny+1, nx+1, 2)
 
 
