@@ -11,7 +11,25 @@ governing equation** (e.g. collapsing a reaction term to a constant). This repo
 reproduces that method on the 1D diffusion-reaction benchmark and adds several
 uncertainty-aware variants.
 
-## Benchmark
+## Benchmark suite
+
+Faithful data generators for all four benchmarks from the paper are included. The
+PI-DeepONet method and its variants currently run on `diffusion_reaction`; the
+other three generators are available to extend the method to (their solvers are
+the slow, GPU/Kaggle-oriented part).
+
+| generator | operator | dim | solver used to make the data |
+|---|---|---|---|
+| `diffusion_reaction` | `v(x) → u(x)` | 1D | method of manufactured solutions (no solver) |
+| `burgers` | `u₀(x) → u(x,t)` | 2D | Fourier pseudo-spectral + forward Euler, ν=0.01 |
+| `cavity_flow` | `Re → (u_x,u_y)(x,y)` | 2D | D2Q9 Lattice-Boltzmann, power-law rheology (n=1.5) |
+| `hyperelastic` | `ε → (u_x,u_y)(x,y)` | 2D | Q1 neo-Hookean FEM, Newton + load continuation |
+
+Each generator is self-contained (`numpy`, plus `scipy.sparse` for the FEM) and
+vectorised over the sample axis. Run a generator directly to cache its `.npz`,
+e.g. `python datasets/burgers.py`.
+
+## Diffusion-reaction benchmark (the reproduced one)
 
 The learned operator is `v(x) → u(x)`, where `u` solves
 
@@ -30,6 +48,9 @@ The misspecified operator drops the reaction nonlinearity to a constant:
 deeponet.py            DeepONet + exact forward-mode trunk derivatives (jvp)
 datasets/
   diffusion_reaction.py   v → u, manufactured solutions
+  burgers.py              u₀ → u(x,t), ν=0.01, GRF ICs, pseudo-spectral solver
+  cavity_flow.py          Re → velocity, power-law n=1.5, Re∈[100,200], LBM
+  hyperelastic.py         ε → displacement, neo-Hookean beam, ε∈[0,0.2], FEM
 run_correction.py      the paper's method: PI-DeepONet, three-mode comparison
 method_ensemble.py     variant: deep-ensemble correction (epistemic UQ)
 method_heteroscedastic.py  variant: variance head + Gaussian NLL (aleatoric UQ)
