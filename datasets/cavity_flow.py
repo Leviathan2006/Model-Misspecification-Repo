@@ -34,6 +34,8 @@ import os
 
 import numpy as np
 
+from ._cache import load_cache
+
 N_POWER = 1.5
 
 # D2Q9 lattice (y points up)
@@ -70,8 +72,27 @@ def _strain_magnitude(fneq, rho, tau):
     return np.sqrt(2.0 * (Sxx**2 + Syy**2 + 2.0 * Sxy**2))
 
 
-def solve_cavity(Re, N=101, U0=0.1, max_iter=60000, tol=1e-6, check_every=200):
-    """Solve the batch of cavity flows. Re: (S,). Returns u of shape (S, N, N, 2)."""
+def solve_cavity(Re, N=101, U0=0.1, max_iter=500000, tol=1e-6, check_every=500,
+                 enforce_bc=True):
+    """Solve the batch of cavity flows. Re: (S,).
+
+    Returns (u, p, info) with u of shape (S, N, N, 2), p of shape (S, N, N) and
+    info a dict holding the per-sample convergence measure E and a converged
+    flag. The paper's stopping rule is used: E = sum|u_{T+500} - u_T| / sum|u_T|
+    over all grid points and velocity components, terminate at E <= 1e-6, with a
+    5e5 iteration cap.
+
+    Pressure comes from the lattice equation of state, P = c_s^2 rho, reported as
+    a gauge pressure (domain mean removed) since incompressible pressure is only
+    defined up to a constant. The paper's cavity experiment needs it: it learns a
+    separate pressure operator G_xi : Re -> P and reports a P column in Table 4.
+
+    With enforce_bc=True the stored field has the exact Dirichlet values written
+    onto the wall nodes. Half-way bounce-back places the physical wall midway
+    between the node row and the ghost row, so the raw node values sit a few
+    percent off zero; that is fine for a finite-volume reading of the data but
+    not for imposing a boundary residual, which is what the method does with it.
+    """
     Re = np.atleast_1d(np.asarray(Re, dtype=np.float64))
     S = Re.shape[0]
     nu0 = (U0 * (N - 1) / Re).reshape(S, 1, 1)
@@ -87,6 +108,8 @@ def solve_cavity(Re, N=101, U0=0.1, max_iter=60000, tol=1e-6, check_every=200):
     tau = np.full((S, N, N), 0.6)
 
     prev = None
+    E = np.full(S, np.inf)
+    n_iter = max_iter
     for it in range(max_iter):
         rho = f.sum(axis=1)
         ux = np.einsum("i,siyx->syx", _C[:, 0], f) / rho
@@ -109,16 +132,33 @@ def solve_cavity(Re, N=101, U0=0.1, max_iter=60000, tol=1e-6, check_every=200):
         f = _apply_boundaries(f, rho, u_lid, U0)
 
         if (it + 1) % check_every == 0:
-            speed = np.sqrt(ux**2 + uy**2)
+            vel = np.stack([ux, uy], axis=-1)
             if prev is not None:
-                num = np.abs(speed - prev).sum(axis=(1, 2))
-                den = np.abs(speed).sum(axis=(1, 2)) + 1e-12
-                if np.max(num / den) < tol:
+                num = np.abs(vel - prev).sum(axis=(1, 2, 3))
+                den = np.abs(vel).sum(axis=(1, 2, 3)) + 1e-12
+                E = num / den
+                if np.max(E) < tol:
+                    n_iter = it + 1
                     break
-            prev = speed
+            prev = vel
 
     out = np.stack([ux, uy], axis=-1)                       # (S, N, N, 2)
-    return out
+    p = _CS2 * rho
+    p = p - p.mean(axis=(1, 2), keepdims=True)              # gauge pressure
+
+    if enforce_bc:
+        out[:, 0, :, :] = 0.0                               # bottom no-slip
+        out[:, :, 0, :] = 0.0                               # left no-slip
+        out[:, :, -1, :] = 0.0                              # right no-slip
+        out[:, -1, :, 0] = U0 * u_lid[None, :]              # lid
+        out[:, -1, :, 1] = 0.0
+
+    converged = E < tol
+    if not np.all(converged):
+        print(f"WARNING: cavity LBM did not reach E <= {tol:g} for "
+              f"{int((~converged).sum())}/{S} sample(s) within {max_iter} "
+              f"iterations (worst E = {np.max(E):.2e})")
+    return out, p, {"E": E, "converged": converged, "n_iter": n_iter}
 
 
 def _apply_boundaries(f, rho, u_lid, U0):
@@ -144,37 +184,41 @@ def _apply_boundaries(f, rho, u_lid, U0):
     return f
 
 
-def generate(n_samples, N=101, seed=0, max_iter=60000, tol=1e-6, chunk=100):
-    """Return (x, y, Re, u) with u of shape (n_samples, N, N, 2).
+def generate(n_samples, N=101, seed=0, max_iter=500000, tol=1e-6, chunk=100):
+    """Return (x, y, Re, u, p) with u of shape (n_samples, N, N, 2) and p of
+    shape (n_samples, N, N).
 
     Samples are solved in chunks so the vectorised LBM state stays within memory
     (a full 1000-sample batch at 101x101 would need many GB)."""
     rng = np.random.default_rng(seed)
     Re = rng.uniform(100.0, 200.0, size=n_samples)
-    parts = []
+    us, ps = [], []
     for i in range(0, n_samples, chunk):
-        parts.append(solve_cavity(Re[i:i + chunk], N=N,
-                                  max_iter=max_iter, tol=tol))
-    u = np.concatenate(parts, axis=0)
+        u_c, p_c, _ = solve_cavity(Re[i:i + chunk], N=N,
+                                   max_iter=max_iter, tol=tol)
+        us.append(u_c)
+        ps.append(p_c)
     grid = np.linspace(0.0, 1.0, N)
-    return grid, grid, Re, u
+    return grid, grid, Re, np.concatenate(us, axis=0), np.concatenate(ps, axis=0)
 
 
 def get_dataset(data_dir="data", n_train=1000, n_test=100, N=101, seed=0,
-                max_iter=60000, tol=1e-6, chunk=100):
+                max_iter=500000, tol=1e-6, chunk=100):
     """Load cached data or generate + cache it.
-    Returns (coords, Re_train, u_train, Re_test, u_test)."""
+    Returns (coords, Re_train, u_train, p_train, Re_test, u_test, p_test)."""
     path = os.path.join(data_dir, "cavity_flow.npz")
-    if os.path.exists(path):
-        d = np.load(path)
-        return ((d["x"], d["y"]), d["Re_train"], d["u_train"],
-                d["Re_test"], d["u_test"])
-    x, y, Re_tr, u_tr = generate(n_train, N, seed, max_iter, tol, chunk)
-    _, _, Re_te, u_te = generate(n_test, N, seed + 1, max_iter, tol, chunk)
+    d = load_cache(path, n_train, n_test, [("u_train", 1, N)])
+    if d is not None and "p_train" in d.files:
+        return ((d["x"], d["y"]), d["Re_train"], d["u_train"], d["p_train"],
+                d["Re_test"], d["u_test"], d["p_test"])
+    if d is not None:
+        print(f"NOTE: {path} predates the pressure field -- regenerating.")
+    x, y, Re_tr, u_tr, p_tr = generate(n_train, N, seed, max_iter, tol, chunk)
+    _, _, Re_te, u_te, p_te = generate(n_test, N, seed + 1, max_iter, tol, chunk)
     os.makedirs(data_dir, exist_ok=True)
-    np.savez(path, x=x, y=y, Re_train=Re_tr, u_train=u_tr,
-             Re_test=Re_te, u_test=u_te)
-    return (x, y), Re_tr, u_tr, Re_te, u_te
+    np.savez(path, x=x, y=y, Re_train=Re_tr, u_train=u_tr, p_train=p_tr,
+             Re_test=Re_te, u_test=u_te, p_test=p_te)
+    return (x, y), Re_tr, u_tr, p_tr, Re_te, u_te, p_te
 
 
 if __name__ == "__main__":
@@ -182,12 +226,14 @@ if __name__ == "__main__":
     p.add_argument("--n_train", type=int, default=1000)
     p.add_argument("--n_test", type=int, default=100)
     p.add_argument("--N", type=int, default=101)
-    p.add_argument("--max_iter", type=int, default=60000)
+    p.add_argument("--max_iter", type=int, default=500000)
     p.add_argument("--data_dir", type=str, default="data")
     a = p.parse_args()
-    (x, y), Re_tr, u_tr, Re_te, u_te = get_dataset(
+    (x, y), Re_tr, u_tr, p_tr, Re_te, u_te, p_te = get_dataset(
         a.data_dir, a.n_train, a.n_test, a.N, max_iter=a.max_iter)
-    print(f"cavity_flow: train u {u_tr.shape}, test u {u_te.shape}")
+    print(f"cavity_flow: train u {u_tr.shape} p {p_tr.shape}, "
+          f"test u {u_te.shape} p {p_te.shape}")
     spd = np.sqrt((u_tr**2).sum(-1))
     print(f"  Re in [{Re_tr.min():.1f}, {Re_tr.max():.1f}], "
-          f"speed max {spd.max():.4f}, any NaN: {np.isnan(u_tr).any()}")
+          f"speed max {spd.max():.4f}, |p| max {np.abs(p_tr).max():.4e}, "
+          f"any NaN: {np.isnan(u_tr).any()}")

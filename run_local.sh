@@ -37,21 +37,26 @@ else:
     print("WARNING: no GPU visible — will run on CPU")
 PY
 
-echo ">>> [4/4] running FNO baselines + physics-guided correction"
-# vanilla FNO baselines on all four problems (uses the bundled data/*.npz)
-python kaggle_run.py --epochs 500
-# the paper's method (known vs misspecified vs corrected) on diffusion-reaction;
-# a Blackwell GPU handles a long run easily, so push the epochs up
-python physics_correction.py --mode all --epochs 100000
+echo ">>> [4/4] running the paper's method (diffusion-reaction)"
+# quick sanity check first, then the full paper-setting run
+python run_correction.py --mode all --quick
+# known vs misspecified vs corrected at the paper's Table 1 settings
+python run_correction.py --mode all
 
 cat <<'MSG'
 
-Done. Results in results/ (baselines.md + figures/).
+Done.
 
 Notes:
-  * To regenerate data at the paper's full sizes, delete the cached files first:
-        rm data/*.npz
-    then re-run (the cavity LBM / hyperelastic FEM generation is CPU-bound).
+  * run_correction.py needs no dataset file: it evaluates the manufactured
+    diffusion-reaction solution analytically at its own sensor / collocation /
+    observation points.
+  * The other three benchmarks have data generators but the method is not yet
+    implemented for them. To build their data at the paper's sizes:
+        python datasets/burgers.py --n_train 2000 --n_test 100
+        python datasets/cavity_flow.py --n_train 1000 --n_test 100 --N 101
+        python datasets/hyperelastic.py --n_train 200 --n_test 100
+    (the cavity LBM and hyperelastic FEM are CPU-bound -- hours, not minutes).
   * If you saw an sm_120 / "no kernel image" error, reinstall torch with:
         pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
 MSG

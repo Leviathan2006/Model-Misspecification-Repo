@@ -29,6 +29,8 @@ import os
 
 import numpy as np
 
+from ._cache import load_cache
+
 # scipy is imported lazily inside the solver so the repo runs on the bundled
 # datasets without scipy installed (it is only needed to *generate* this data).
 
@@ -163,15 +165,60 @@ def _min_detF(coords, elems, u):
     return detF.min()
 
 
-def solve_beam(eps, nx=100, ny=20, n_steps=25, newton_tol=1e-8, max_newton=40):
-    """Solve one beam at compression eps. Returns u field (ny+1, nx+1, 2).
+def _newton(coords, elems, u, Fext, free, scale, tol, max_it):
+    """Globalised Newton on the free dofs of u (modified in place).
 
-    Robust against post-buckling element inversion: load continuation over
-    n_steps, and a backtracking line search that shrinks each Newton update
-    until no element is inverted (det F > 0 everywhere). This keeps the solution
-    on the physical branch instead of blowing up to nonphysical displacements.
+    The line search backtracks on the *residual norm* (Armijo), not merely on
+    element inversion: a step is accepted only if it keeps det F > 0 everywhere
+    AND reduces ||R||. Returns True iff the load step converged.
     """
     from scipy.sparse.linalg import spsolve
+    Fint, K = _element_terms(coords, elems, u)
+    R = (Fint - Fext)[free]
+    rn = np.linalg.norm(R)
+    for _ in range(max_it):
+        if rn < tol * scale:
+            return True
+        try:
+            du = spsolve(K[free][:, free].tocsc(), -R)
+        except Exception:
+            return False
+        if not np.all(np.isfinite(du)):
+            return False
+        alpha, accepted = 1.0, False
+        for _ in range(40):
+            u_try = u.copy()
+            u_try[free] += alpha * du
+            if _min_detF(coords, elems, u_try) > 1e-8:
+                Fint_t, K_t = _element_terms(coords, elems, u_try)
+                R_t = (Fint_t - Fext)[free]
+                rn_t = np.linalg.norm(R_t)
+                if np.isfinite(rn_t) and rn_t < (1.0 - 1e-4 * alpha) * rn:
+                    u[free] = u_try[free]
+                    R, rn, K = R_t, rn_t, K_t
+                    accepted = True
+                    break
+            alpha *= 0.5
+        if not accepted:
+            return False
+    return rn < tol * scale
+
+
+def solve_beam(eps, nx=100, ny=20, n_steps=25, newton_tol=1e-8, max_newton=40,
+               min_frac=1e-4, strict=True):
+    """Solve one beam at compression eps. Returns u field (ny+1, nx+1, 2).
+
+    The beam buckles: for this geometry the clamped-clamped Euler load is
+    P_cr = 4 pi^2 E I / L^2 with I = h^3/12, i.e. a critical strain of about
+    eps_cr = P_cr / (E h) ~ 0.033, so most of the eps in [0, 0.2] range is deep
+    post-buckling. That needs (a) load continuation, (b) a Newton line search
+    that actually decreases the residual, and (c) step-size cutback when a load
+    increment fails to converge. The downward body force f = (0, -1000) breaks
+    the symmetry and selects the physical branch.
+
+    With strict=True (default) a load step that cannot be converged even after
+    repeated halving raises, instead of silently returning a diverged field.
+    """
     coords, elems, nid = _mesh(nx, ny)
     ndof = coords.shape[0] * 2
     Fext = _body_force(coords, elems)
@@ -183,48 +230,61 @@ def solve_beam(eps, nx=100, ny=20, n_steps=25, newton_tol=1e-8, max_newton=40):
     scale = 1.0 + np.linalg.norm(Fext[free])
 
     u = np.zeros(ndof)
-    for step in range(1, n_steps + 1):
-        eps_s = eps * step / n_steps
-        u[2 * right] = -eps_s                              # prescribed u_x on right
+    done = 0.0                                   # load fraction already applied
+    dfrac = 1.0 / n_steps
+    while done < 1.0 - 1e-12:
+        frac = min(done + dfrac, 1.0)
+        u_bak = u.copy()
+        u[2 * right] = -eps * frac               # prescribed u_x on right edge
         u[2 * right + 1] = 0.0
-        for _ in range(max_newton):
-            Fint, K = _element_terms(coords, elems, u)
-            Rf = (Fint - Fext)[free]
-            if np.linalg.norm(Rf) < newton_tol * scale:
+        if _newton(coords, elems, u, Fext, free, scale, newton_tol, max_newton):
+            done = frac
+            dfrac = min(dfrac * 1.5, 1.0 / n_steps)     # cautiously grow back
+        else:
+            u = u_bak                            # roll back and cut the step
+            dfrac *= 0.5
+            if dfrac < min_frac:
+                msg = (f"hyperelastic: Newton failed at eps={eps:.4f}, load "
+                       f"fraction {done:.4f} (step below {min_frac})")
+                if strict:
+                    raise RuntimeError(msg)
+                print("WARNING: " + msg)
                 break
-            du = spsolve(K[free][:, free].tocsc(), -Rf)
-            alpha = 1.0                                    # backtracking line search
-            for _ in range(30):
-                u_try = u.copy()
-                u_try[free] += alpha * du
-                if _min_detF(coords, elems, u_try) > 1e-6:
-                    break
-                alpha *= 0.5
-            u[free] += alpha * du
     return u.reshape(-1, 2)[nid]                           # (ny+1, nx+1, 2)
 
 
-def generate(n_samples, nx=100, ny=20, n_steps=10, seed=0):
+def generate(n_samples, nx=100, ny=20, n_steps=25, seed=0, verbose=False):
     """Return (x, y, eps, u) with u of shape (n_samples, ny+1, nx+1, 2)."""
     rng = np.random.default_rng(seed)
     eps = rng.uniform(0.0, 0.2, size=n_samples)
-    fields = np.stack([solve_beam(e, nx, ny, n_steps) for e in eps], axis=0)
+    fields = []
+    for i, e in enumerate(eps):
+        fields.append(solve_beam(e, nx, ny, n_steps))
+        if verbose and (i + 1) % 10 == 0:
+            print(f"  hyperelastic {i+1}/{n_samples}")
+    fields = np.stack(fields, axis=0)
     x = np.linspace(0.0, 1.0, nx + 1)
     y = np.linspace(0.0, 0.1, ny + 1)
     return x, y, eps, fields
 
 
 def get_dataset(data_dir="data", n_train=200, n_test=100, nx=100, ny=20,
-                n_steps=10, seed=0):
+                n_steps=25, seed=0, verbose=False):
     """Load cached data or generate + cache it.
-    Returns (coords, eps_train, u_train, eps_test, u_test)."""
+    Returns (coords, eps_train, u_train, eps_test, u_test).
+
+    Paper Sec. 3.4: 300 compression levels are sampled with eps in [0, 0.2] and
+    the dataset is split 200 train / 100 test -- so both splits come from a
+    single draw here, rather than from two independent seeds."""
     path = os.path.join(data_dir, "hyperelastic.npz")
-    if os.path.exists(path):
-        d = np.load(path)
+    d = load_cache(path, n_train, n_test,
+                   [("u_train", 1, ny + 1), ("u_train", 2, nx + 1)])
+    if d is not None:
         return ((d["x"], d["y"]), d["eps_train"], d["u_train"],
                 d["eps_test"], d["u_test"])
-    x, y, eps_tr, u_tr = generate(n_train, nx, ny, n_steps, seed)
-    _, _, eps_te, u_te = generate(n_test, nx, ny, n_steps, seed + 1)
+    x, y, eps, u = generate(n_train + n_test, nx, ny, n_steps, seed, verbose)
+    eps_tr, u_tr = eps[:n_train], u[:n_train]
+    eps_te, u_te = eps[n_train:], u[n_train:]
     os.makedirs(data_dir, exist_ok=True)
     np.savez(path, x=x, y=y, eps_train=eps_tr, u_train=u_tr,
              eps_test=eps_te, u_test=u_te)
@@ -237,11 +297,11 @@ if __name__ == "__main__":
     p.add_argument("--n_test", type=int, default=100)
     p.add_argument("--nx", type=int, default=100)
     p.add_argument("--ny", type=int, default=20)
-    p.add_argument("--n_steps", type=int, default=10)
+    p.add_argument("--n_steps", type=int, default=25)
     p.add_argument("--data_dir", type=str, default="data")
     a = p.parse_args()
     (x, y), eps_tr, u_tr, eps_te, u_te = get_dataset(
-        a.data_dir, a.n_train, a.n_test, a.nx, a.ny, a.n_steps)
+        a.data_dir, a.n_train, a.n_test, a.nx, a.ny, a.n_steps, verbose=True)
     print(f"hyperelastic: train u {u_tr.shape}, test u {u_te.shape}")
     print(f"  eps in [{eps_tr.min():.3f}, {eps_tr.max():.3f}], "
           f"|u_x| max {np.abs(u_tr[...,0]).max():.4e}, any NaN: {np.isnan(u_tr).any()}")

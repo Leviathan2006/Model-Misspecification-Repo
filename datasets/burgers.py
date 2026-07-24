@@ -29,13 +29,40 @@ import os
 
 import numpy as np
 
+from ._cache import load_cache
+
 NU = 0.01
 
 
-def grf(n, N, sigma=25.0, tau=5.0, gamma=4.0, rng=None):
+def grf(n, N, sigma=25.0, tau=5.0, gamma=4.0, rng=None, scale=1.0):
     """Sample n periodic Gaussian random fields on N points.
 
-    Covariance sigma^2 (-Laplacian + tau^2 I)^{-gamma}. Real fields via rfft.
+    Covariance sigma^2 (-Laplacian + tau^2 I)^{-gamma}, i.e. the Karhunen-Loeve
+    expansion u(x) = sum_k sigma ((2 pi k)^2 + tau^2)^{-gamma/2} (a_k cos + b_k sin)
+    on [0, 1] with periodic boundary conditions. Real fields via rfft.
+
+    AMPLITUDE CAVEAT -- UNRESOLVED. With the paper's printed parameters
+    (sigma=25, tau=5, gamma=4) this gives std(u0) ~ 0.012 and |u| <~ 0.036 over
+    the whole solution field. The paper's Fig. 7 colourbars for the Case-A/B/C
+    correction targets are inconsistent with that, and inconsistent with each
+    other under any single rescaling of u0:
+
+        target            paper   scale needed   (scaling in u)
+        A: eps u^3 (eps=10)  0.48     ~10          cubic
+        B: u u_x             1.22      ~8          quadratic
+        C: nu u_xx           0.34      ~0.6        linear
+
+    A and B agree on an initial condition roughly 8-10x larger than the formula
+    yields, while C -- the only one linear in u -- wants one slightly *smaller*.
+    So the mismatch is not a pure amplitude factor: the paper's fields must also
+    carry different spectral content (C is sensitive to curvature, A and B to
+    amplitude). The initial-condition distribution therefore cannot be recovered
+    from the text as printed, and Cases A-C cannot all be reproduced at once
+    until that is pinned down.
+
+    The KL sampling below is the correct discretisation of the stated
+    covariance, so it stays the default (scale=1.0) and `scale` is exposed as an
+    explicit knob rather than silently fudging the covariance to fit one figure.
     """
     if rng is None:
         rng = np.random.default_rng(0)
@@ -50,7 +77,7 @@ def grf(n, N, sigma=25.0, tau=5.0, gamma=4.0, rng=None):
     coeff[:, 0] = 0.0
     if N % 2 == 0:
         coeff[:, -1] = coeff[:, -1].real
-    return np.fft.irfft(coeff, n=N, axis=1) * N
+    return np.fft.irfft(coeff, n=N, axis=1) * N * scale
 
 
 def solve_burgers(u0, nu=NU, T=1.0, dt=2.5e-4, n_save=101):
@@ -87,26 +114,30 @@ def solve_burgers(u0, nu=NU, T=1.0, dt=2.5e-4, n_save=101):
     return out
 
 
-def generate(n_samples, n_x=201, seed=0):
+def generate(n_samples, n_x=201, seed=0, u0_scale=1.0):
     """Return (x, u0, uT, field). field is the full (n, 101, n_x) space-time."""
     rng = np.random.default_rng(seed)
     x = np.linspace(0.0, 1.0, n_x, endpoint=False)
-    u0 = grf(n_samples, n_x, rng=rng)
+    u0 = grf(n_samples, n_x, rng=rng, scale=u0_scale)
     field = solve_burgers(u0)
+    if not np.all(np.isfinite(field)):
+        raise RuntimeError("burgers: solver produced non-finite values -- "
+                           "forward Euler went unstable, reduce dt or u0_scale")
     return x, field[:, 0, :].copy(), field[:, -1, :].copy(), field
 
 
-def get_dataset(data_dir="data", n_train=2000, n_test=100, n_x=201, seed=0):
+def get_dataset(data_dir="data", n_train=2000, n_test=100, n_x=201, seed=0,
+                u0_scale=1.0):
     """Load cached data or generate + cache it. Returns
     (t, x, u0_train, field_train, u0_test, field_test), where the learned
     operator maps the initial condition u0(x) to the full field u(x, t)."""
     path = os.path.join(data_dir, "burgers.npz")
-    if os.path.exists(path):
-        d = np.load(path)
+    d = load_cache(path, n_train, n_test, [("field_train", 2, n_x)])
+    if d is not None:
         return (d["t"], d["x"], d["u0_train"], d["field_train"],
                 d["u0_test"], d["field_test"])
-    x, u0_tr, _, fld_tr = generate(n_train, n_x, seed)
-    _, u0_te, _, fld_te = generate(n_test, n_x, seed + 1)
+    x, u0_tr, _, fld_tr = generate(n_train, n_x, seed, u0_scale)
+    _, u0_te, _, fld_te = generate(n_test, n_x, seed + 1, u0_scale)
     t = np.linspace(0.0, 1.0, fld_tr.shape[1])
     os.makedirs(data_dir, exist_ok=True)
     np.savez(path, t=t, x=x, u0_train=u0_tr, field_train=fld_tr,
@@ -119,10 +150,14 @@ if __name__ == "__main__":
     p.add_argument("--n_train", type=int, default=2000)
     p.add_argument("--n_test", type=int, default=100)
     p.add_argument("--n_x", type=int, default=201)
+    p.add_argument("--u0_scale", type=float, default=1.0,
+                   help="initial-condition amplitude; 1.0 = the paper's printed "
+                        "GRF. Its Fig. 7 implies 8-10 for Cases A/B but ~0.6 "
+                        "for Case C -- see the caveat in grf()")
     p.add_argument("--data_dir", type=str, default="data")
     a = p.parse_args()
     t, x, u0_tr, fld_tr, u0_te, fld_te = get_dataset(
-        a.data_dir, a.n_train, a.n_test, a.n_x)
+        a.data_dir, a.n_train, a.n_test, a.n_x, u0_scale=a.u0_scale)
     print(f"burgers: train u0 {u0_tr.shape}, field {fld_tr.shape}; "
           f"test field {fld_te.shape}")
     print(f"  |u0| range [{u0_tr.min():.3f}, {u0_tr.max():.3f}], "

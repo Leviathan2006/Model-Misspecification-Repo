@@ -32,6 +32,8 @@ import os
 
 import numpy as np
 
+from ._cache import load_cache
+
 D = 0.1
 N_MODES = 5
 
@@ -77,8 +79,8 @@ def generate(n_samples, n_x=201, seed=0):
 def get_dataset(data_dir="data", n_train=1000, n_test=100, n_x=201, seed=0):
     """Load cached data or generate + cache it. Returns (x, Xtr, Ytr, Xte, Yte)."""
     path = os.path.join(data_dir, "diffusion_reaction.npz")
-    if os.path.exists(path):
-        d = np.load(path)
+    d = load_cache(path, n_train, n_test, [("v_train", 1, n_x)])
+    if d is not None:
         return d["x"], d["v_train"], d["u_train"], d["v_test"], d["u_test"]
     x, v_tr, u_tr = generate(n_train, n_x, seed)
     _, v_te, u_te = generate(n_test, n_x, seed + 1)
