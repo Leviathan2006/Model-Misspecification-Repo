@@ -6,16 +6,25 @@
                       (u . grad) u + grad P - (1/Re) laplacian(u) = 0,  div u = 0
     true          power-law (shear-thinning) viscosity -- only enters the data.
 
-Stage 1  train the velocity prior G_theta and pressure operator G_xi together on
-         the Newtonian physics + velocity boundary data + dense pressure data,
-         then FREEZE both:
-             L1 = ||mom||^2 + ||div u||^2 + lam_bc L_bc(vel) + lam_p L_p(pressure)
+Stage 1  train the velocity prior G_theta and pressure operator G_xi on ONLY what
+         the scientist's Newtonian simulator knows -- the momentum + continuity
+         residual, the a-priori KNOWN velocity BCs (lid profile + no-slip, built
+         analytically) and a pressure-gauge anchor. NO real velocity or pressure
+         data enters G_theta; pressure is solved from the physics, its free
+         additive constant pinned by the gauge (mean P = 0, gauge-invariant for
+         the momentum coupling). Then FREEZE both:
+             L1 = ||mom||^2 + ||div u||^2 + lam_bc L_bc(known) + lam_g (mean P)^2
 Stage 2  train the vector velocity correction G_phi on interior velocity DATA
          only, G_theta frozen:
              u_pred = G_theta + G_phi,  L2 = || u_pred(y_obs) - u(y_obs) ||^2
 
+Departure from the paper: the paper supervises pressure on a dense 81x81 grid to
+stabilise it. That is real data, so under the two-stage philosophy (G_theta uses
+only simulator physics) it is dropped in favour of the gauge anchor -- pressure is
+solved, not observed.
+
 CAVEAT: unlike the other three scripts, this residual has no verified reference in
-the repo -- it is derived here from paper Sec. 3.3. The loss weights lam_bc/lam_p
+the repo -- it is derived here from paper Sec. 3.3. The loss weights lam_bc/lam_g
 are not printed in the paper and are set to reasonable defaults. Treat cavity as
 the highest-risk of the four and validate the physics term before trusting it.
 """
@@ -31,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import datasets.cavity_flow as cf                              # noqa: E402
 from deeponet import DeepONet, enable_fast_math, trunk_jet     # noqa: E402
 
-LAM_BC, LAM_P, LAM_CONT = 100.0, 100.0, 1.0
+LAM_BC, LAM_GAUGE, LAM_CONT = 100.0, 1.0, 1.0
 BETAS = (0.999, 0.999)
 
 
@@ -56,7 +65,9 @@ def build_data(cfg, device, seed=0):
     y_coll = gridpts(cfg["n_c"])
     y_cgrid = gridpts(cfg["n_g"])
 
-    # boundary velocity observations (all four walls)
+    # KNOWN velocity boundary conditions (identical for every sample, independent
+    # of Re): lid profile on the top wall, no-slip elsewhere -- built analytically,
+    # never read from the solution data
     top = [(N - 1, j) for j in range(N)]
     bot = [(0, j) for j in range(N)]
     lef = [(i, 0) for i in range(N)]
@@ -64,18 +75,14 @@ def build_data(cfg, device, seed=0):
     bij = top + bot + lef + rig
     bi = np.array([q[0] for q in bij]); bj = np.array([q[1] for q in bij])
     y_bc = np.stack([x_g[bj], y_g[bi]], axis=1)
-    u_bc = u_tr[:, bi, bj, :]
+    u_bc = np.zeros((y_bc.shape[0], 2))
+    is_top = y_bc[:, 1] > 1.0 - 1e-6
+    u_bc[is_top, 0] = 1.0 - np.cosh(10.0 * (y_bc[is_top, 0] - 0.5)) / np.cosh(5.0)
 
-    # interior velocity observations
+    # interior velocity observations -- the only real data, used in stage 2
     ii = rng.integers(1, N - 1, cfg["N_u"]); jj = rng.integers(1, N - 1, cfg["N_u"])
     y_obs = np.stack([x_g[jj], y_g[ii]], axis=1)
     u_obs = u_tr[:, ii, jj, :]
-
-    # dense pressure observations on a subgrid of the stored nodes
-    pk = np.linspace(0, N - 1, cfg["n_p"]).astype(int)
-    PI, PJ = np.meshgrid(pk, pk, indexing="ij")
-    y_pobs = np.stack([x_g[PJ.ravel()], y_g[PI.ravel()]], axis=1)
-    p_obs = p_tr[:, PI.ravel(), PJ.ravel()]
 
     Xt, Yt = np.meshgrid(x_g, y_g, indexing="ij")
     y_test = np.stack([Xt.ravel(), Yt.ravel()], axis=1)
@@ -87,9 +94,9 @@ def build_data(cfg, device, seed=0):
     return {
         "vs_tr": T(((Re_tr - mu) / sd)[:, None]), "vs_te": T(((Re_te - mu) / sd)[:, None]),
         "Re_tr": T(Re_tr[:, None]),
-        "u_bc": T(u_bc), "u_obs": T(u_obs), "p_obs": T(p_obs), "u_test": T(u_test),
+        "u_bc": T(u_bc), "u_obs": T(u_obs), "u_test": T(u_test),
         "y_coll": T(y_coll), "y_cgrid": T(y_cgrid), "y_bc": T(y_bc),
-        "y_obs": T(y_obs), "y_pobs": T(y_pobs), "y_test": T(y_test),
+        "y_obs": T(y_obs), "y_test": T(y_test),
     }
 
 
@@ -132,20 +139,19 @@ def train_prior(d, cfg, device, seed=0):
         opt.zero_grad(set_to_none=True)
         bv, bp = vel.branch_out(vs), pre.branch_out(vs)
         u, ux, uy, uxx, uyy = _vjet(vel, bv, d["y_coll"])
-        _, Px, Py = _pgrad(pre, bp, d["y_coll"])
+        P, Px, Py = _pgrad(pre, bp, d["y_coll"])
         inv_Re = (1.0 / Re).view(-1, 1, 1)
         res = momentum(u, ux, uy, uxx, uyy, Px, Py, inv_Re)
         cont = ux[..., 0] + uy[..., 1]
-        l_bc = ((_vvalue(vel, bv, d["y_bc"]) - d["u_bc"][idx]) ** 2).mean()
-        p_pred, _, _ = _pgrad(pre, bp, d["y_pobs"])
-        l_p = ((p_pred - d["p_obs"][idx]) ** 2).mean()
+        l_bc = ((_vvalue(vel, bv, d["y_bc"]) - d["u_bc"]) ** 2).mean()   # known BC
+        l_gauge = (P.mean(dim=1) ** 2).mean()          # pin pressure gauge (no data)
         loss = ((res ** 2).mean() + LAM_CONT * (cont ** 2).mean()
-                + LAM_BC * l_bc + LAM_P * l_p)
+                + LAM_BC * l_bc + LAM_GAUGE * l_gauge)
         loss.backward()
         opt.step()
         if (epoch + 1) % max(1, cfg["epochs_prior"] // 5) == 0 or epoch == 0:
             print(f"  [prior] epoch {epoch+1:6d}  loss {loss.item():.3e} "
-                  f"(bc {l_bc.item():.2e} p {l_p.item():.2e})")
+                  f"(bc {l_bc.item():.2e} gauge {l_gauge.item():.2e})")
     vel.eval(); pre.eval()
     return vel
 
@@ -197,10 +203,10 @@ def evaluate(vel, corr, d, cfg):
             "u": rel_l2(mag(u), mag(ref))}
 
 
-FULL = dict(M_train=20, M_test=10, N=61, n_c=41, n_g=21, N_u=250, n_p=41,
+FULL = dict(M_train=20, M_test=10, N=61, n_c=41, n_g=21, N_u=250,
             p=100, width=128, depth=4, lr=1e-3, betas=BETAS,
             epochs_prior=40000, epochs_corr=20000, batch=8, eval_batch=5, data_dir=None)
-QUICK = dict(M_train=20, M_test=10, N=61, n_c=21, n_g=11, N_u=200, n_p=21,
+QUICK = dict(M_train=20, M_test=10, N=61, n_c=21, n_g=11, N_u=200,
              p=100, width=128, depth=4, lr=1e-3, betas=BETAS,
              epochs_prior=200, epochs_corr=200, batch=8, eval_batch=5, data_dir=None)
 

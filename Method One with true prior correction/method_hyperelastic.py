@@ -5,11 +5,14 @@
 
 Operator  G : eps |-> u = (u_x, u_y), eps the right-boundary compression.
 
-Stage 1  train the prior G_theta alone on physics + boundary + energy of the
-         KNOWN-but-misspecified (linear-elastic) operator N0, then FREEZE it:
-             L1 = || N0[G_theta] + f ||^2 + lam_bc L_bc + lam_e Pi(G_theta)
-Stage 2  train the correction G_phi on the DATA loss only (interior displacement
-         observations), G_theta frozen:
+Stage 1  train the prior G_theta on ONLY what the scientist's (linear-elastic)
+         simulator knows -- physics residual, the a-priori KNOWN Dirichlet edges
+         (left clamp u=0, right compression u=(-eps,0)) and a model-consistent
+         energy -- then FREEZE it. No observed displacements enter G_theta:
+             L1 = || N0[G_theta] + f ||^2 + lam_bc L_dir + lam_e Pi(G_theta)
+Stage 2  train the correction G_phi on the DATA loss only, G_theta frozen. The
+         real-data supervision is the interior observations PLUS the traction-free
+         top/bottom boundary (whose displacement is part of the solution):
              u_pred = G_theta + G_phi,   L2 = || u_pred(y_obs) - u(y_obs) ||^2
 
 Nondimensionalisation follows the paper: stresses, body force and material
@@ -81,6 +84,14 @@ def strain_energy(gradu):
     return 0.5 * MU * (trFtF - 2.0 - 2.0 * lnJ) + 0.5 * LAM * lnJ ** 2
 
 
+def linear_strain_energy(gradu):
+    """Linear-elastic energy density -- the energy of the MISSPECIFIED model, so
+    the prior's variational term matches its own (wrong) constitutive law."""
+    eps = 0.5 * (gradu + gradu.transpose(-1, -2))
+    tr = eps[..., 0, 0] + eps[..., 1, 1]
+    return 0.5 * LAM * tr ** 2 + MU * (eps ** 2).sum(dim=(-2, -1))
+
+
 def rel_l2(pred, true):
     p = pred.reshape(pred.shape[0], -1)
     t = true.reshape(true.shape[0], -1)
@@ -105,19 +116,26 @@ def build_data(cfg, device, seed=0):
     y_coll = grid(cfg["n_cx"], cfg["n_cy"])
     y_cgrid = grid(cfg["n_gx"], cfg["n_gy"])
 
+    # stage-2 data: interior observations + traction-free top/bottom (observed,
+    # since displacement on the free edges is part of the true solution)
     ii = rng.integers(1, ny - 1, cfg["N_u"])
     jj = rng.integers(1, nx - 1, cfg["N_u"])
-    y_obs = np.stack([x_g[jj], y_g[ii]], axis=1)
-    u_obs_tr = u_tr[:, ii, jj, :]
-
     bj = np.linspace(0, nx - 1, cfg["n_btb"]).astype(int)
+    tb_i = np.concatenate([np.zeros_like(bj), np.full_like(bj, ny - 1)])   # bot, top
+    tb_j = np.concatenate([bj, bj])
+    obs_i = np.concatenate([ii, tb_i])
+    obs_j = np.concatenate([jj, tb_j])
+    y_obs = np.stack([x_g[obs_j], y_g[obs_i]], axis=1)
+    u_obs_tr = u_tr[:, obs_i, obs_j, :]
+
+    # stage-1 KNOWN Dirichlet edges: left clamp (u=0), right compression
+    # (u=(-eps,0)) -- built analytically from eps, never from the solution
     bi = np.linspace(0, ny - 1, cfg["n_blr"]).astype(int)
-    b_ij = ([(0, j) for j in bj] + [(ny - 1, j) for j in bj] +
-            [(i, 0) for i in bi] + [(i, nx - 1) for i in bi])
-    bi_a = np.array([q[0] for q in b_ij])
-    bj_a = np.array([q[1] for q in b_ij])
-    y_bc = np.stack([x_g[bj_a], y_g[bi_a]], axis=1)
-    u_bc_tr = u_tr[:, bi_a, bj_a, :]
+    dir_i = np.concatenate([bi, bi])
+    dir_j = np.concatenate([np.zeros_like(bi), np.full_like(bi, nx - 1)])  # left, right
+    y_dir = np.stack([x_g[dir_j], y_g[dir_i]], axis=1)
+    u_dir_tr = np.zeros((u_tr.shape[0], dir_i.size, 2))
+    u_dir_tr[:, bi.size:, 0] = -eps_tr[:, None]                            # right u_x
 
     Xt, Yt = np.meshgrid(x_g, y_g, indexing="ij")
     y_test = np.stack([Xt.ravel(), Yt.ravel()], axis=1)
@@ -134,9 +152,9 @@ def build_data(cfg, device, seed=0):
 
     return {
         "vs_tr": T(vs_tr / sd), "vs_te": T(vs_te / sd),
-        "u_obs_tr": T(u_obs_tr), "u_bc_tr": T(u_bc_tr),
+        "u_obs_tr": T(u_obs_tr), "u_dir_tr": T(u_dir_tr),
         "y_coll": T(y_coll), "y_cgrid": T(y_cgrid), "y_obs": T(y_obs),
-        "y_bc": T(y_bc), "y_test": T(y_test), "u_test": T(u_test), "quad": T(w),
+        "y_dir": T(y_dir), "y_test": T(y_test), "u_test": T(u_test), "quad": T(w),
     }
 
 
@@ -172,8 +190,8 @@ def train_prior(operator, d, cfg, device, seed=0):
         bp = prior.branch_out(vs)
         u, (gradu, H) = _jet(prior, bp, d["y_coll"])
         res = (div_P(gradu, H) if operator == "true" else div_sigma(H)) + f_body
-        l_bc = ((_value(prior, bp, d["y_bc"]) - d["u_bc_tr"][idx]) ** 2).mean()
-        W = strain_energy(gradu)
+        l_bc = ((_value(prior, bp, d["y_dir"]) - d["u_dir_tr"][idx]) ** 2).mean()
+        W = strain_energy(gradu) if operator == "true" else linear_strain_energy(gradu)
         l_e = ((W - (u * f_body).sum(-1)) * d["quad"]).sum(-1).mean()
         loss = (res ** 2).mean() + LAM_BC * l_bc + LAM_E * l_e
         loss.backward()
