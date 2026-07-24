@@ -13,10 +13,12 @@ uncertainty-aware variants.
 
 ## Benchmark suite
 
-Faithful data generators for all four benchmarks from the paper are included. The
-PI-DeepONet method and its variants currently run on `diffusion_reaction`; the
-other three generators are available to extend the method to (their solvers are
-the slow, GPU/Kaggle-oriented part).
+Faithful data generators for all four benchmarks from the paper are included, at
+the paper's own sizes (not toy/reduced versions — see **Caches** below). The
+PI-DeepONet method is implemented for three of the four: `diffusion_reaction`
+(`run_correction.py`), `burgers` (`run_burgers.py`) and `hyperelastic`
+(`run_hyperelastic.py`). `cavity_flow` has a verified generator but no method
+driver yet (see Layout below for why).
 
 | generator | operator | dim | solver used to make the data |
 |---|---|---|---|
@@ -29,12 +31,17 @@ Each generator is self-contained (`numpy`, plus `scipy.sparse` for the FEM) and
 vectorised over the sample axis. Run a generator directly to cache its `.npz`,
 e.g. `python datasets/burgers.py`.
 
-**Caches.** The bundled `data/*.npz` are small demo files, *not* the paper's
-sizes. `get_dataset` validates the cache against the requested sample counts and
-grid and regenerates on a mismatch (it used to return the cache regardless, which
-silently gave you 20 samples when you asked for 1000). Paper sizes are 1000/100
-(diffusion-reaction), 2000/100 (burgers), 1000/100 at 101×101 (cavity),
-200/100 at 21×101 (hyperelastic); the last two are hours of CPU.
+**Caches.** Every generator produces the paper's true system at the paper's own
+sizes and resolution when you ask for it — nothing here is a toy or reduced
+version of the physics. The only thing that's smaller is the *pre-bundled*
+snapshot committed to `data/*.npz`, kept small so the repo stays lightweight to
+clone. `get_dataset` validates that cache against the requested sample counts
+and grid and regenerates automatically on a mismatch (it used to return the
+small cache regardless of what was asked for — a bug, now fixed). Paper sizes are
+1000/100 (diffusion-reaction), 2000/100 (burgers), 1000/100 at 101×101 (cavity),
+200/100 at 21×101 (hyperelastic); the last two take hours of CPU to generate
+fresh, so `run_hyperelastic.py --mode all` will regenerate its data on first use
+unless you've already cached it at those sizes.
 
 **Known gap — burgers amplitude.** The GRF as printed in the paper
 (`N(0, 25²(−Δ+5²I)⁻⁴)`) yields `std(u₀) ≈ 0.012`, but the Fig. 7 colourbars imply
@@ -43,7 +50,7 @@ rescaling satisfies all three, so the paper's IC distribution can't be recovered
 from the text. The generator implements the printed formula (the correct KL
 discretisation) and exposes `--u0_scale`. See the caveat in `burgers.grf`.
 
-## Diffusion-reaction benchmark (the reproduced one)
+## Diffusion-reaction benchmark
 
 The learned operator is `v(x) → u(x)`, where `u` solves
 
