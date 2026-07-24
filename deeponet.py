@@ -1,16 +1,3 @@
-"""DeepONet with exact autodiff derivatives for physics-informed training.
-
-This is the backbone the paper actually uses (Ma, Boulle, Yang, Wu & Guo, 2026,
-arXiv:2606.03469). A DeepONet represents the solution as
-
-    u(v)(y) = sum_k  branch_k(v) * trunk_k(y)  +  bias
-
-so any derivative in the query variable y acts only on the trunk:
-    d^n u / dy^n = sum_k branch_k(v) * d^n trunk_k / dy^n .
-We therefore differentiate the (shared) trunk basis once per step with batched
-autograd and combine it with the branch coefficients -- exact, mesh-free, and far
-cheaper than differentiating u per sample.
-"""
 import torch
 import torch.nn as nn
 from torch.func import jvp
@@ -31,9 +18,6 @@ class MLP(nn.Module):
 
 
 class DeepONet(nn.Module):
-    """Unstacked DeepONet. branch_in = m sensors (+ extra channels for a serial
-    correction network). trunk_in = query dimension (1 for x, 2 for (x,t) etc.)."""
-
     def __init__(self, branch_in, trunk_in=1, p=100, width=64, depth=4):
         super().__init__()
         hidden = [width] * (depth - 1)
@@ -53,15 +37,6 @@ class DeepONet(nn.Module):
 
 
 def trunk_derivatives(trunk, y, order=2):
-    """Return the trunk basis and its y-derivatives at query points y (1D input).
-
-    Uses FORWARD-mode autodiff (jvp): since the trunk input is one-dimensional, a
-    single jvp yields the derivative of all p basis functions at once -- O(1)
-    passes instead of O(p). Nested jvp gives the second derivative. The outputs
-    stay connected to the trunk parameters, so loss.backward() trains normally.
-
-    Returns t (Q,p) and, up to `order`, first/second derivatives (Q,p).
-    """
     ones = torch.ones_like(y)
     if order == 1:
         t, t_y = jvp(trunk, (y,), (ones,))
@@ -71,7 +46,6 @@ def trunk_derivatives(trunk, y, order=2):
 
 
 def enable_fast_math():
-    """TF32 + cuDNN autotune -- real speedups on Ampere/Hopper/Blackwell."""
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
